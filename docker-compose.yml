@@ -14,7 +14,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "4001":"4000"
+      - "4001:4000"
 
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
