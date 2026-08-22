@@ -5,16 +5,21 @@ services:
       context: .
       dockerfile: litellm/Dockerfile
 
+    depends_on:
+      litellm-db:
+        condition: service_healthy
+
     image: local/ai-gateway-litellm:latest
     container_name: litellm
     restart: unless-stopped
 
-    expose:
-      - "4000"
+    ports:
+      - "4001":"4000"
 
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
-
+      DATABASE_URL: >-
+        postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@litellm-db:5432/${POSTGRES_DB}
       KAIDESHARK_OLLAMA_URL: ${KAIDESHARK_OLLAMA_URL}
       KHARESSAADARA_OLLAMA_URL: ${KHARESSAADARA_OLLAMA_URL}
       GALACTUS_OLLAMA_URL: ${GALACTUS_OLLAMA_URL}
@@ -29,6 +34,29 @@ services:
     networks:
       - ai-gateway
 
+  litellm-db:
+    image: postgres:16-alpine
+    container_name: litellm-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - /mnt/38tb/containers/data/ai-gateway/postgres:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+    networks:
+      - ai-gateway
 
   scheduler:
     build:
