@@ -1,0 +1,51 @@
+model_list:
+
+  # FAST - Qwen 3.5 4B
+
+  - model_name: fast-kaide
+    litellm_params:
+      model: ollama/qwen3.5:4b
+      api_base: os.environ/KAIDESHARK_OLLAMA_URL
+
+  - model_name: fast-kharessa
+    litellm_params:
+      model: ollama/qwen3.5:4b
+      api_base: os.environ/KHARESSAADARA_OLLAMA_URL
+
+  - model_name: fast-galactus
+    litellm_params:
+      model: ollama/qwen3.5:4b
+      api_base: os.environ/GALACTUS_OLLAMA_URL
+
+
+  # BALANCED - Qwen 3.5 9B
+
+  - model_name: balanced-kaide
+    litellm_params:
+      model: ollama/qwen3.5:9b
+      api_base: os.environ/KAIDESHARK_OLLAMA_URL
+
+  - model_name: balanced-kharessa
+    litellm_params:
+      model: ollama/qwen3.5:9b
+      api_base: os.environ/KHARESSAADARA_OLLAMA_URL
+
+
+  # HEAVY - Qwen 3.5 27B
+
+  - model_name: heavy-kaide
+    litellm_params:
+      model: ollama/qwen3.5:27b
+      api_base: os.environ/KAIDESHARK_OLLAMA_URL
+
+
+  # BACKGROUND
+
+  - model_name: background-galactus
+    litellm_params:
+      model: ollama/qwen3.5:4b
+      api_base: os.environ/GALACTUS_OLLAMA_URL
+
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
