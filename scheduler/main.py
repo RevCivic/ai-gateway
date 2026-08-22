@@ -1,5 +1,6 @@
 import asyncio
 import os
+import secrets
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
@@ -13,6 +14,7 @@ LITELLM_URL = os.getenv(
     "http://litellm:4000"
 ).rstrip("/")
 
+LITELLM_MASTER_KEY = os.environ["LITELLM_MASTER_KEY"]
 KAIDESHARK_AGENT_URL = os.environ["KAIDESHARK_AGENT_URL"]
 KHARESSAADARA_AGENT_URL = os.environ["KHARESSAADARA_AGENT_URL"]
 GALACTUS_OLLAMA_URL = os.environ["GALACTUS_OLLAMA_URL"].rstrip("/")
@@ -334,6 +336,38 @@ def filtered_headers(request):
     }
 
 
+def unauthorized_response():
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": {
+                "message":
+                    "Authentication Error, invalid or missing API key.",
+                "type": "auth_error",
+                "param": None,
+                "code": "401",
+            }
+        },
+    )
+
+
+def authorize_request(request):
+    authorization = request.headers.get(
+        "authorization",
+        "",
+    )
+
+    scheme, _, token = authorization.partition(" ")
+
+    if scheme.lower() != "bearer" or not token:
+        return False
+
+    return secrets.compare_digest(
+        token.strip(),
+        LITELLM_MASTER_KEY,
+    )
+
+
 @app.get("/health")
 async def health():
     return {
@@ -387,7 +421,10 @@ async def scheduler_status():
 
 
 @app.get("/v1/models")
-async def models():
+async def models(request: Request):
+    if not authorize_request(request):
+        return unauthorized_response()
+
     return {
         "object": "list",
         "data": [
@@ -406,6 +443,9 @@ async def models():
 async def chat_completions(
     request: Request
 ):
+    if not authorize_request(request):
+        return unauthorized_response()
+
     try:
         body = await request.json()
 
