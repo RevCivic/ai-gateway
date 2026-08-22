@@ -1,9 +1,9 @@
 services:
 
-litellm:
-  build:
-    context: .
-    dockerfile: litellm/Dockerfile
+  litellm:
+    build:
+      context: .
+      dockerfile: litellm/Dockerfile
 
     image: local/ai-gateway-litellm:latest
     container_name: litellm
@@ -29,10 +29,12 @@ litellm:
     networks:
       - ai-gateway
 
-scheduler:
-  build:
-    context: ./scheduler
 
+  scheduler:
+    build:
+      context: ./scheduler
+
+    image: local/ai-scheduler:latest
     container_name: ai-scheduler
     restart: unless-stopped
 
