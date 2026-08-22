@@ -9,12 +9,11 @@ services:
       litellm-db:
         condition: service_healthy
 
-    image: local/ai-gateway-litellm:latest
     container_name: litellm
     restart: unless-stopped
 
     ports:
-      - "4001:4000"
+      - "127.0.0.1:4001:4000"
 
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
@@ -62,7 +61,6 @@ services:
     build:
       context: ./scheduler
 
-    image: local/ai-scheduler:latest
     container_name: ai-scheduler
     restart: unless-stopped
 
