@@ -1,0 +1,62 @@
+services:
+
+litellm:
+  build:
+    context: .
+    dockerfile: litellm/Dockerfile
+
+    image: local/ai-gateway-litellm:latest
+    container_name: litellm
+    restart: unless-stopped
+
+    expose:
+      - "4000"
+
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+
+      KAIDESHARK_OLLAMA_URL: ${KAIDESHARK_OLLAMA_URL}
+      KHARESSAADARA_OLLAMA_URL: ${KHARESSAADARA_OLLAMA_URL}
+      GALACTUS_OLLAMA_URL: ${GALACTUS_OLLAMA_URL}
+
+    command:
+      - "--config"
+      - "/app/config.yaml"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - ai-gateway
+
+scheduler:
+  build:
+    context: ./scheduler
+
+    container_name: ai-scheduler
+    restart: unless-stopped
+
+    depends_on:
+      - litellm
+
+    ports:
+      - "4000:4000"
+
+    environment:
+      LITELLM_URL: http://litellm:4000
+
+      KAIDESHARK_AGENT_URL: ${KAIDESHARK_AGENT_URL}
+      KHARESSAADARA_AGENT_URL: ${KHARESSAADARA_AGENT_URL}
+
+      GALACTUS_OLLAMA_URL: ${GALACTUS_OLLAMA_URL}
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - ai-gateway
+
+
+networks:
+  ai-gateway:
+    driver: bridge
