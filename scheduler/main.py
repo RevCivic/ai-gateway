@@ -34,6 +34,12 @@ GALACTUS_OLLAMA_URL = os.environ["GALACTUS_OLLAMA_URL"].rstrip("/")
 STREAMING_FIRST_BYTE_TIMEOUT = 30.0
 STREAMING_IDLE_TIMEOUT = 60.0
 WORKER_HEALTH_CHECK_TIMEOUT = 3.0
+HEALTH_CHECK_CACHE_TTL = 10.0  # Cache health checks for 10 seconds
+
+# Circuit breaker settings
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = 3  # Failures before circuit opens
+CIRCUIT_BREAKER_RECOVERY_BASE = 5.0    # Base recovery time in seconds
+CIRCUIT_BREAKER_RECOVERY_MAX = 300.0   # Max recovery time (5 minutes)
 
 
 # ============================================================================
@@ -79,6 +85,108 @@ class StructuredLogger:
 
 
 logger = StructuredLogger(__name__)
+
+
+# ============================================================================
+# Circuit Breaker & Health Check State
+# ============================================================================
+
+class WorkerState:
+    """Tracks health and circuit breaker state for a worker."""
+
+    def __init__(self):
+        self.failure_count = 0
+        self.last_failure_time: Optional[float] = None
+        self.circuit_open = False
+        self.circuit_open_time: Optional[float] = None
+        self.health_cache = None
+        self.health_cache_time: Optional[float] = None
+
+    def record_failure(self):
+        """Record a failure and update circuit breaker state."""
+        self.last_failure_time = time.time()
+        self.failure_count += 1
+
+        if (
+            self.failure_count >= 
+            CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        ):
+            self.circuit_open = True
+            self.circuit_open_time = time.time()
+
+    def record_success(self):
+        """Record a success and reset failure counter."""
+        self.failure_count = 0
+        self.last_failure_time = None
+        
+        # Close circuit on success
+        if self.circuit_open:
+            self.circuit_open = False
+            self.circuit_open_time = None
+
+    def can_accept_request(self) -> bool:
+        """Check if worker can accept requests (circuit not open or backoff expired)."""
+        if not self.circuit_open:
+            return True
+
+        # Circuit is open - check if backoff period has expired
+        if self.circuit_open_time is None:
+            return True
+
+        elapsed = time.time() - self.circuit_open_time
+        
+        # Exponential backoff: base * 2^(attempts - threshold)
+        backoff_attempts = max(
+            0,
+            self.failure_count - CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        )
+        backoff_time = min(
+            CIRCUIT_BREAKER_RECOVERY_BASE * (2 ** backoff_attempts),
+            CIRCUIT_BREAKER_RECOVERY_MAX,
+        )
+
+        if elapsed >= backoff_time:
+            # Attempt to recover - close circuit and reset failures
+            self.circuit_open = False
+            self.circuit_open_time = None
+            self.failure_count = 0
+            return True
+
+        return False
+
+    def cache_health(self, health_data):
+        """Cache health check result."""
+        self.health_cache = health_data
+        self.health_cache_time = time.time()
+
+    def get_cached_health(self) -> Optional[dict]:
+        """Get cached health if not expired."""
+        if (
+            self.health_cache is None or
+            self.health_cache_time is None
+        ):
+            return None
+
+        elapsed = time.time() - self.health_cache_time
+        if elapsed < HEALTH_CHECK_CACHE_TTL:
+            return self.health_cache
+
+        return None
+
+    def invalidate_cache(self):
+        """Invalidate health cache on failure."""
+        self.health_cache = None
+        self.health_cache_time = None
+
+
+# Per-worker state tracking
+worker_states = {
+    "KaideShark": WorkerState(),
+    "KharessaAdara": WorkerState(),
+    "Galactus": WorkerState(),
+}
+
+worker_states_lock = asyncio.Lock()
 
 
 # ============================================================================
@@ -156,9 +264,14 @@ inflight_lock = asyncio.Lock()
 client = None
 
 
+# Background health check task
+health_check_task = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client
+    global health_check_task
 
     logger.info("Initializing HTTP client")
 
@@ -175,10 +288,25 @@ async def lifespan(app: FastAPI):
         ),
     )
 
+    # Start background health check task
+    logger.info("Starting background health check task")
+    health_check_task = asyncio.create_task(
+        background_health_check_loop()
+    )
+
     yield
 
     logger.info("Closing HTTP client")
     await client.aclose()
+
+    # Cancel background task
+    if health_check_task:
+        health_check_task.cancel()
+        try:
+            await health_check_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Background health check task stopped")
 
 
 app = FastAPI(
@@ -389,6 +517,85 @@ async def get_worker_status(worker):
     return await get_agent_status(worker)
 
 
+# ============================================================================
+# Background Health Check Task
+# ============================================================================
+
+async def background_health_check_loop():
+    """
+    Continuously poll worker health in the background.
+    
+    Caches results to reduce synchronous blocking during request routing.
+    """
+    logger.info("Background health check loop started")
+
+    while True:
+        try:
+            await asyncio.sleep(HEALTH_CHECK_CACHE_TTL)
+
+            for worker in worker_states.keys():
+                try:
+                    status = await get_worker_status(worker)
+                    
+                    async with worker_states_lock:
+                        worker_states[worker].cache_health(status)
+
+                    logger.debug(
+                        "Background health check cached",
+                        worker=worker,
+                        eligible=status.get("eligible", False),
+                    )
+
+                except Exception as e:
+                    logger.warning(
+                        "Background health check error",
+                        worker=worker,
+                        error=str(e),
+                    )
+
+        except asyncio.CancelledError:
+            logger.info("Background health check loop cancelled")
+            break
+
+        except Exception as e:
+            logger.error(
+                "Background health check loop error",
+                error=str(e),
+            )
+            await asyncio.sleep(5)  # Brief delay before retry
+
+
+async def get_cached_or_fresh_status(worker):
+    """
+    Get cached health status if available, otherwise fetch fresh.
+    
+    Falls back to fresh fetch if cache is expired.
+    """
+    async with worker_states_lock:
+        state = worker_states.get(worker)
+        if state is None:
+            return await get_worker_status(worker)
+
+        # Try cache first
+        cached = state.get_cached_health()
+        if cached is not None:
+            logger.debug(
+                "Using cached health status",
+                worker=worker,
+            )
+            return cached
+
+    # Cache miss - fetch fresh
+    status = await get_worker_status(worker)
+    
+    async with worker_states_lock:
+        state = worker_states.get(worker)
+        if state is not None:
+            state.cache_health(status)
+
+    return status
+
+
 async def current_inflight(worker):
     async with inflight_lock:
         return inflight[worker]
@@ -421,11 +628,11 @@ async def rank_candidates(logical_model, request_id: str):
     status_map = {}
 
     #
-    # Poll candidate nodes concurrently.
+    # Get health status for candidates (cached or fresh).
     #
     results = await asyncio.gather(
         *[
-            get_worker_status(
+            get_cached_or_fresh_status(
                 item["worker"]
             )
             for item in definitions
@@ -444,6 +651,20 @@ async def rank_candidates(logical_model, request_id: str):
 
         if not status:
             continue
+
+        # Circuit breaker check
+        async with worker_states_lock:
+            state = worker_states.get(worker)
+            if state and not state.can_accept_request():
+                logger.debug(
+                    "Worker excluded by circuit breaker",
+                    request_id=request_id,
+                    model=logical_model,
+                    worker=worker,
+                    failure_count=state.failure_count,
+                )
+                status_map[worker]["scheduler_reason"] = "circuit_breaker"
+                continue
 
         #
         # Hard exclusion:
@@ -863,6 +1084,19 @@ async def chat_completions(
                         error=last_error[:200],
                     )
 
+                    # Record failure for circuit breaker
+                    async with worker_states_lock:
+                        state = worker_states.get(worker)
+                        if state:
+                            state.record_failure()
+                            state.invalidate_cache()
+                            logger.debug(
+                                "Circuit breaker: failure recorded",
+                                worker=worker,
+                                failure_count=state.failure_count,
+                                circuit_open=state.circuit_open,
+                            )
+
                     continue
 
                 # Validate streaming response starts successfully
@@ -961,7 +1195,33 @@ async def chat_completions(
                     worker=worker,
                     error=validation_error,
                 )
+
+                # Record failure for circuit breaker
+                async with worker_states_lock:
+                    state = worker_states.get(worker)
+                    if state:
+                        state.record_failure()
+                        state.invalidate_cache()
+                        logger.debug(
+                            "Circuit breaker: failure recorded",
+                            worker=worker,
+                            failure_count=state.failure_count,
+                            circuit_open=state.circuit_open,
+                        )
+
                 continue
+
+            # Success - record it
+            async with worker_states_lock:
+                state = worker_states.get(worker)
+                if state:
+                    state.record_success()
+                    logger.debug(
+                        "Circuit breaker: success recorded",
+                        worker=worker,
+                        failure_count=state.failure_count,
+                        circuit_open=state.circuit_open,
+                    )
 
             headers = {
                 "X-AI-Worker":
@@ -1007,6 +1267,19 @@ async def chat_completions(
                 error=last_error,
             )
 
+            # Record failure for circuit breaker
+            async with worker_states_lock:
+                state = worker_states.get(worker)
+                if state:
+                    state.record_failure()
+                    state.invalidate_cache()
+                    logger.debug(
+                        "Circuit breaker: failure recorded",
+                        worker=worker,
+                        failure_count=state.failure_count,
+                        circuit_open=state.circuit_open,
+                    )
+
             continue
 
         except Exception as exc:
@@ -1020,6 +1293,19 @@ async def chat_completions(
                 worker=worker,
                 error=last_error,
             )
+
+            # Record failure for circuit breaker
+            async with worker_states_lock:
+                state = worker_states.get(worker)
+                if state:
+                    state.record_failure()
+                    state.invalidate_cache()
+                    logger.debug(
+                        "Circuit breaker: failure recorded",
+                        worker=worker,
+                        failure_count=state.failure_count,
+                        circuit_open=state.circuit_open,
+                    )
 
             continue
 
