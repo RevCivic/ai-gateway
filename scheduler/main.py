@@ -1,13 +1,24 @@
 import asyncio
+import json
+import logging
 import os
 import secrets
+import sys
+import time
+import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import AsyncGenerator, Optional
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+
+# ============================================================================
+# Configuration
+# ============================================================================
 
 LITELLM_URL = os.getenv(
     "LITELLM_URL",
@@ -19,6 +30,60 @@ KAIDESHARK_AGENT_URL = os.environ["KAIDESHARK_AGENT_URL"]
 KHARESSAADARA_AGENT_URL = os.environ["KHARESSAADARA_AGENT_URL"]
 GALACTUS_OLLAMA_URL = os.environ["GALACTUS_OLLAMA_URL"].rstrip("/")
 
+# Timeout settings (in seconds)
+STREAMING_FIRST_BYTE_TIMEOUT = 30.0
+STREAMING_IDLE_TIMEOUT = 60.0
+WORKER_HEALTH_CHECK_TIMEOUT = 3.0
+
+
+# ============================================================================
+# Structured Logging
+# ============================================================================
+
+class StructuredLogger:
+    """JSON-formatted structured logger for better observability."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(logging.INFO)
+
+        # Console handler with JSON formatting
+        if not self.logger.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            self.logger.addHandler(handler)
+
+    def _log(self, level: str, message: str, **kwargs):
+        """Log a structured message."""
+        log_entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "logger": self.name,
+            "level": level,
+            "message": message,
+            **kwargs,
+        }
+        self.logger.info(json.dumps(log_entry))
+
+    def info(self, message: str, **kwargs):
+        self._log("INFO", message, **kwargs)
+
+    def error(self, message: str, **kwargs):
+        self._log("ERROR", message, **kwargs)
+
+    def warning(self, message: str, **kwargs):
+        self._log("WARNING", message, **kwargs)
+
+    def debug(self, message: str, **kwargs):
+        self._log("DEBUG", message, **kwargs)
+
+
+logger = StructuredLogger(__name__)
+
+
+# ============================================================================
+# Route Configuration
+# ============================================================================
 
 #
 # Measured throughput from our actual benchmarks.
@@ -81,6 +146,10 @@ AGENTS = {
 }
 
 
+# ============================================================================
+# State Management
+# ============================================================================
+
 inflight = defaultdict(int)
 inflight_lock = asyncio.Lock()
 
@@ -91,17 +160,24 @@ client = None
 async def lifespan(app: FastAPI):
     global client
 
+    logger.info("Initializing HTTP client")
+
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(
             connect=5.0,
             read=900.0,
             write=30.0,
             pool=5.0,
-        )
+        ),
+        limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=50,
+        ),
     )
 
     yield
 
+    logger.info("Closing HTTP client")
     await client.aclose()
 
 
@@ -110,6 +186,122 @@ app = FastAPI(
     version="1.0",
     lifespan=lifespan,
 )
+
+
+# ============================================================================
+# SSE Streaming Helpers
+# ============================================================================
+
+async def stream_sse_events(
+    response: httpx.Response,
+    request_id: str,
+    timeout: float = STREAMING_FIRST_BYTE_TIMEOUT,
+) -> AsyncGenerator[bytes, None]:
+    """
+    Stream SSE events with proper line-buffering and timeout protection.
+
+    Ensures complete SSE frames are sent, avoiding partial responses.
+    Includes first-byte timeout detection.
+    """
+    buffer = b""
+    start_time = time.time()
+    last_byte_time = start_time
+    first_byte_received = False
+
+    try:
+        async for chunk in response.aiter_raw():
+            # Check first-byte timeout
+            if not first_byte_received:
+                first_byte_received = True
+                elapsed = time.time() - start_time
+                logger.info(
+                    "SSE: First byte received",
+                    request_id=request_id,
+                    elapsed_ms=round(elapsed * 1000),
+                )
+
+            # Add chunk to buffer
+            buffer += chunk
+            last_byte_time = time.time()
+
+            # Process complete lines
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                # Yield complete line with newline
+                yield line + b"\n"
+
+        # Yield any remaining data
+        if buffer:
+            yield buffer
+
+        elapsed = time.time() - start_time
+        logger.info(
+            "SSE: Stream completed",
+            request_id=request_id,
+            elapsed_ms=round(elapsed * 1000),
+        )
+
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_time
+        logger.error(
+            "SSE: Stream timeout",
+            request_id=request_id,
+            first_byte_received=first_byte_received,
+            elapsed_ms=round(elapsed * 1000),
+        )
+        raise
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(
+            "SSE: Stream error",
+            request_id=request_id,
+            error=str(e),
+            elapsed_ms=round(elapsed * 1000),
+        )
+        raise
+
+
+# ============================================================================
+# Response Validation
+# ============================================================================
+
+def validate_non_streaming_response(
+    content: bytes,
+    status_code: int,
+    request_id: str,
+) -> Optional[str]:
+    """
+    Validate non-streaming response content.
+
+    Returns error message if validation fails, None if valid.
+    """
+    # Check status code is success
+    if status_code >= 400:
+        return f"HTTP {status_code}"
+
+    # Check content is not empty
+    if not content:
+        logger.warning(
+            "Empty response body received",
+            request_id=request_id,
+            status_code=status_code,
+        )
+        return "Empty response body"
+
+    # Try to parse as JSON to detect malformed responses
+    try:
+        json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "Invalid JSON in response",
+            request_id=request_id,
+            status_code=status_code,
+            error=str(e),
+        )
+        return f"Invalid JSON: {str(e)}"
+
+    return None
 
 
 async def get_agent_status(worker):
@@ -121,13 +313,23 @@ async def get_agent_status(worker):
     try:
         response = await client.get(
             url,
-            timeout=3.0,
+            timeout=WORKER_HEALTH_CHECK_TIMEOUT,
         )
         response.raise_for_status()
+
+        logger.debug(
+            f"Agent health check succeeded",
+            worker=worker,
+        )
 
         return response.json()
 
     except Exception as exc:
+        logger.debug(
+            f"Agent health check failed",
+            worker=worker,
+            error=str(exc),
+        )
         return {
             "hostname": worker,
             "eligible": False,
@@ -142,10 +344,14 @@ async def get_galactus_status():
     try:
         response = await client.get(
             f"{GALACTUS_OLLAMA_URL}/api/tags",
-            timeout=3.0,
+            timeout=WORKER_HEALTH_CHECK_TIMEOUT,
         )
 
         response.raise_for_status()
+
+        logger.debug(
+            "Galactus health check succeeded",
+        )
 
         return {
             "hostname": "Galactus",
@@ -162,6 +368,10 @@ async def get_galactus_status():
         }
 
     except Exception as exc:
+        logger.debug(
+            "Galactus health check failed",
+            error=str(exc),
+        )
         return {
             "hostname": "Galactus",
             "eligible": False,
@@ -197,10 +407,15 @@ async def release(worker):
         )
 
 
-async def rank_candidates(logical_model):
+async def rank_candidates(logical_model, request_id: str):
     definitions = ROUTES.get(logical_model)
 
     if not definitions:
+        logger.warning(
+            "Unknown logical model",
+            request_id=request_id,
+            model=logical_model,
+        )
         return [], {}
 
     status_map = {}
@@ -246,6 +461,13 @@ async def rank_candidates(logical_model):
             "eligible",
             False
         ):
+            logger.debug(
+                "Worker excluded by eligibility",
+                request_id=request_id,
+                model=logical_model,
+                worker=worker,
+                reasons=status.get("reasons", []),
+            )
             continue
 
         worker_inflight = await current_inflight(
@@ -296,6 +518,14 @@ async def rank_candidates(logical_model):
                     "scheduler_reason"
                 ] = "external_gpu_busy"
 
+                logger.debug(
+                    "Worker excluded by GPU utilization",
+                    request_id=request_id,
+                    model=logical_model,
+                    worker=worker,
+                    gpu_util=gpu_util,
+                )
+
                 continue
 
             elif gpu_util >= 60:
@@ -316,6 +546,13 @@ async def rank_candidates(logical_model):
     ranked.sort(
         key=lambda x: x["score"],
         reverse=True,
+    )
+
+    logger.info(
+        "Worker ranking complete",
+        request_id=request_id,
+        model=logical_model,
+        ranked_count=len(ranked),
     )
 
     return ranked, status_map
@@ -377,6 +614,13 @@ async def health():
 
 @app.get("/scheduler/status")
 async def scheduler_status():
+    request_id = str(uuid.uuid4())
+
+    logger.info(
+        "Status request received",
+        request_id=request_id,
+    )
+
     workers = {}
 
     for worker in (
@@ -398,7 +642,8 @@ async def scheduler_status():
 
     for logical_model in ROUTES:
         ranked, _ = await rank_candidates(
-            logical_model
+            logical_model,
+            request_id,
         )
 
         routing[logical_model] = [
@@ -413,6 +658,11 @@ async def scheduler_status():
             }
             for item in ranked
         ]
+
+    logger.info(
+        "Status request completed",
+        request_id=request_id,
+    )
 
     return {
         "workers": workers,
@@ -443,13 +693,31 @@ async def models(request: Request):
 async def chat_completions(
     request: Request
 ):
+    # Generate request ID for tracing
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+
+    logger.info(
+        "Request received",
+        request_id=request_id,
+    )
+
     if not authorize_request(request):
+        logger.warning(
+            "Unauthorized request",
+            request_id=request_id,
+        )
         return unauthorized_response()
 
     try:
         body = await request.json()
 
-    except Exception:
+    except Exception as e:
+        logger.error(
+            "Failed to parse request JSON",
+            request_id=request_id,
+            error=str(e),
+        )
         return JSONResponse(
             status_code=400,
             content={
@@ -465,6 +733,11 @@ async def chat_completions(
     )
 
     if logical_model not in ROUTES:
+        logger.warning(
+            "Unknown model requested",
+            request_id=request_id,
+            model=logical_model,
+        )
         return JSONResponse(
             status_code=400,
             content={
@@ -480,11 +753,17 @@ async def chat_completions(
 
     ranked, statuses = (
         await rank_candidates(
-            logical_model
+            logical_model,
+            request_id,
         )
     )
 
     if not ranked:
+        logger.error(
+            "No eligible workers available",
+            request_id=request_id,
+            model=logical_model,
+        )
         return JSONResponse(
             status_code=503,
             content={
@@ -510,7 +789,7 @@ async def chat_completions(
     # If the selected backend fails before
     # a response begins, try the next one.
     #
-    for candidate in ranked:
+    for candidate_idx, candidate in enumerate(ranked):
 
         worker = candidate["worker"]
         deployment = (
@@ -521,6 +800,14 @@ async def chat_completions(
 
         forwarded_body["model"] = (
             deployment
+        )
+
+        logger.info(
+            "Attempting worker",
+            request_id=request_id,
+            candidate_idx=candidate_idx,
+            worker=worker,
+            deployment=deployment,
         )
 
         await acquire(worker)
@@ -568,18 +855,52 @@ async def chat_completions(
                         )
                     )
 
+                    logger.warning(
+                        "Worker returned server error",
+                        request_id=request_id,
+                        worker=worker,
+                        status_code=upstream.status_code,
+                        error=last_error[:200],
+                    )
+
+                    continue
+
+                # Validate streaming response starts successfully
+                if not upstream.content:
+                    await upstream.aclose()
+                    await release(worker)
+
+                    logger.warning(
+                        "Streaming response is empty",
+                        request_id=request_id,
+                        worker=worker,
+                    )
+
+                    last_error = "Empty streaming response"
                     continue
 
                 async def stream_response():
                     try:
-                        async for chunk in (
-                            upstream.aiter_raw()
+                        async for chunk in stream_sse_events(
+                            upstream,
+                            request_id,
+                            STREAMING_FIRST_BYTE_TIMEOUT,
                         ):
                             yield chunk
 
                     finally:
                         await upstream.aclose()
                         await release(worker)
+
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            "Streaming completed",
+                            request_id=request_id,
+                            worker=worker,
+                            elapsed_ms=round(
+                                elapsed * 1000
+                            ),
+                        )
 
                 headers = {
                     "X-AI-Worker":
@@ -588,12 +909,20 @@ async def chat_completions(
                         logical_model,
                     "X-AI-Deployment":
                         deployment,
+                    "X-Request-ID":
+                        request_id,
                     "Content-Type":
                         upstream.headers.get(
                             "content-type",
                             "text/event-stream",
                         ),
                 }
+
+                logger.info(
+                    "Streaming response started",
+                    request_id=request_id,
+                    worker=worker,
+                )
 
                 return StreamingResponse(
                     stream_response(),
@@ -615,12 +944,22 @@ async def chat_completions(
             await release(worker)
 
             #
-            # Retry another eligible node
-            # only for server/backend errors.
+            # Validate response content before returning.
+            # Retry another eligible node if validation fails.
             #
-            if upstream.status_code >= 500:
-                last_error = (
-                    upstream.text
+            validation_error = validate_non_streaming_response(
+                upstream.content,
+                upstream.status_code,
+                request_id,
+            )
+
+            if validation_error:
+                last_error = validation_error
+                logger.warning(
+                    "Response validation failed",
+                    request_id=request_id,
+                    worker=worker,
+                    error=validation_error,
                 )
                 continue
 
@@ -631,7 +970,18 @@ async def chat_completions(
                     logical_model,
                 "X-AI-Deployment":
                     deployment,
+                "X-Request-ID":
+                    request_id,
             }
+
+            elapsed = time.time() - start_time
+            logger.info(
+                "Request completed",
+                request_id=request_id,
+                worker=worker,
+                status_code=upstream.status_code,
+                elapsed_ms=round(elapsed * 1000),
+            )
 
             return Response(
                 content=upstream.content,
@@ -645,12 +995,42 @@ async def chat_completions(
                 headers=headers,
             )
 
+        except asyncio.TimeoutError as e:
+            await release(worker)
+
+            last_error = f"Timeout: {str(e)}"
+
+            logger.error(
+                "Request timeout",
+                request_id=request_id,
+                worker=worker,
+                error=last_error,
+            )
+
+            continue
+
         except Exception as exc:
             await release(worker)
 
             last_error = str(exc)
 
+            logger.error(
+                "Request error",
+                request_id=request_id,
+                worker=worker,
+                error=last_error,
+            )
+
             continue
+
+    elapsed = time.time() - start_time
+    logger.error(
+        "All workers exhausted",
+        request_id=request_id,
+        model=logical_model,
+        last_error=last_error,
+        elapsed_ms=round(elapsed * 1000),
+    )
 
     return JSONResponse(
         status_code=503,
@@ -660,6 +1040,8 @@ async def chat_completions(
                     "All eligible workers failed",
                 "detail":
                     last_error,
+                "request_id":
+                    request_id,
             }
         },
     )
